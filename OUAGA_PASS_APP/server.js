@@ -1,47 +1,64 @@
-'use strict';
-const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
-const ROOT=__dirname,DATA=path.join(ROOT,'data','db.json'),PUBLIC=path.join(ROOT,'public');
-const PORT=Number(process.env.PORT||3000),ADMIN_EMAIL=(process.env.ADMIN_EMAIL||'landrycompaore950@gmail.com').toLowerCase();
-const ADMIN_PASSWORD=process.env.ADMIN_PASSWORD;
-if(!ADMIN_PASSWORD || ADMIN_PASSWORD.length<12){console.error('Définissez ADMIN_PASSWORD (12 caractères minimum) avant le démarrage.');process.exit(1)}
-const sha=s=>crypto.createHash('sha256').update(s).digest('hex');
-const uid=()=>crypto.randomUUID();
-const passwordHash=p=>{let salt=crypto.randomBytes(16).toString('hex');return salt+':'+crypto.scryptSync(p,salt,64).toString('hex')};
-const verify=(p,h)=>{try{const [salt,hash]=h.split(':');const actual=crypto.scryptSync(p,salt,64),expected=Buffer.from(hash,'hex');return actual.length===expected.length&&crypto.timingSafeEqual(actual,expected)}catch{return false}};
-const read=()=>JSON.parse(fs.readFileSync(DATA,'utf8'));
-const save=db=>{let tmp=DATA+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db,null,2),{mode:0o600});fs.renameSync(tmp,DATA)};
-if(!fs.existsSync(DATA))save({users:[],events:[],tickets:[],orders:[],sessions:[],logs:[]});
-let db=read();if(!db.users.some(u=>u.role==='admin')){db.users.push({id:uid(),name:'Administrateur OUAGA PASS',email:ADMIN_EMAIL,pass:passwordHash(ADMIN_PASSWORD),role:'admin',createdAt:new Date().toISOString()});save(db);console.log('Compte super administrateur initialisé : '+ADMIN_EMAIL)}
-const now=()=>new Date().toISOString();
-const json=(res,status,obj,headers={})=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers});res.end(JSON.stringify(obj))};
-const fail=(res,status,msg)=>json(res,status,{error:msg});
-const clean=s=>String(s??'').trim();
-const safeUser=u=>u&&({id:u.id,name:u.name,email:u.email,role:u.role});
-function session(req){const match=(req.headers.cookie||'').match(/(?:^|;\s*)op_session=([a-f0-9]{64})(?:;|$)/);if(!match)return null;const s=db.sessions.find(s=>s.hash===sha(match[1])&&s.expires>Date.now());return s?db.users.find(u=>u.id===s.userId):null}
-function originAllowed(req){let origin=req.headers.origin;if(!origin)return true;try{return new URL(origin).host===req.headers.host}catch{return false}}
-function log(action,userId,details){db.logs.push({id:uid(),action,userId,details,at:now()});if(db.logs.length>2000)db.logs=db.logs.slice(-2000)}
-function eventPublic(e){const owner=db.users.find(u=>u.id===e.ownerId);return {...e,ownerName:owner?.name||'Organisateur'}}
-function eventAccess(user,e){return user&&(user.role==='admin'||e.ownerId===user.id)}
-function body(req){return new Promise((resolve,reject)=>{let chunks=[],size=0;req.on('data',c=>{size+=c.length;if(size>64*1024){reject(new Error('Requête trop volumineuse'));req.destroy()}else chunks.push(c)});req.on('end',()=>{try{resolve(JSON.parse(Buffer.concat(chunks).toString()||'{}'))}catch{reject(new Error('JSON invalide'))}});req.on('error',reject)})}
-function secureCookie(req){return process.env.COOKIE_SECURE==='true'||req.socket.encrypted?' Secure;':''}
-const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png'};
-async function api(req,res,pathname){
- const method=req.method,user=session(req);let b={};if(['POST','PATCH','PUT'].includes(method)){if(!originAllowed(req))return fail(res,403,'Origine refusée');try{b=await body(req)}catch(e){return fail(res,400,e.message)}}
- const route=(m,p)=>method===m&&pathname===p;
- if(route('GET','/api/me'))return json(res,200,{user:safeUser(user),demo:true});
- if(route('POST','/api/register')){const name=clean(b.name).slice(0,100),email=clean(b.email).toLowerCase(),pass=String(b.password||'');if(name.length<2||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||pass.length<12)return fail(res,400,'Nom, e-mail valide et mot de passe de 12 caractères minimum requis');if(db.users.some(u=>u.email===email))return fail(res,409,'Adresse déjà utilisée');let u={id:uid(),name,email,pass:passwordHash(pass),role:'organizer',createdAt:now()};db.users.push(u);save(db);return json(res,201,{message:'Compte organisateur créé. Connectez-vous.'})}
- if(route('POST','/api/login')){const email=clean(b.email).toLowerCase(),u=db.users.find(x=>x.email===email);if(!u||!verify(String(b.password||''),u.pass))return fail(res,401,'Identifiants incorrects');const token=crypto.randomBytes(32).toString('hex');db.sessions.push({hash:sha(token),userId:u.id,expires:Date.now()+7*864e5});save(db);return json(res,200,{user:safeUser(u)},{'Set-Cookie':`op_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800;${secureCookie(req)}`})}
- if(route('POST','/api/logout')){const match=(req.headers.cookie||'').match(/op_session=([a-f0-9]{64})/);if(match)db.sessions=db.sessions.filter(s=>s.hash!==sha(match[1]));save(db);return json(res,200,{ok:true},{'Set-Cookie':`op_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0;${secureCookie(req)}`})}
- if(route('GET','/api/events')){let ev=db.events.filter(e=>e.status==='approved'||eventAccess(user,e)).map(eventPublic).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));return json(res,200,{events:ev})}
- if(route('POST','/api/events')){if(!user||!['admin','organizer'].includes(user.role))return fail(res,401,'Connexion requise');let title=clean(b.title).slice(0,120),location=clean(b.location).slice(0,120),date=clean(b.date),description=clean(b.description).slice(0,500),price=Number(b.price),capacity=Number(b.capacity);if(title.length<3||!location||!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isInteger(price)||price<0||price>1e7||!Number.isInteger(capacity)||capacity<1||capacity>100000)return fail(res,400,'Informations événement invalides');const e={id:uid(),ownerId:user.id,title,location,date,description,price,capacity,status:user.role==='admin'?'approved':'pending',createdAt:now()};db.events.push(e);log('event_created',user.id,e.id);save(db);return json(res,201,{event:eventPublic(e)})}
- const approval=pathname.match(/^\/api\/events\/([a-f0-9-]+)\/status$/);if(method==='PATCH'&&approval){if(user?.role!=='admin')return fail(res,403,'Accès administrateur requis');const e=db.events.find(e=>e.id===approval[1]);if(!e)return fail(res,404,'Événement introuvable');if(!['approved','rejected','pending'].includes(b.status))return fail(res,400,'Statut invalide');e.status=b.status;log('event_status',user.id,{event:e.id,status:e.status});save(db);return json(res,200,{event:eventPublic(e)})}
- if(route('GET','/api/organizers')){if(user?.role!=='admin')return fail(res,403,'Accès administrateur requis');return json(res,200,{organizers:db.users.filter(u=>u.role==='organizer').map(u=>({...safeUser(u),events:db.events.filter(e=>e.ownerId===u.id).length}))})}
- if(route('GET','/api/stats')){if(!user)return fail(res,401,'Connexion requise');const events=db.events.filter(e=>eventAccess(user,e)),ids=new Set(events.map(e=>e.id)),tickets=db.tickets.filter(t=>ids.has(t.eventId)),orders=db.orders.filter(o=>ids.has(o.eventId));return json(res,200,{events:events.length,pending:events.filter(e=>e.status==='pending').length,tickets:tickets.length,used:tickets.filter(t=>t.usedAt).length,revenue:orders.filter(o=>o.status==='paid_demo').reduce((s,o)=>s+o.amount,0),organizers:user.role==='admin'?db.users.filter(u=>u.role==='organizer').length:undefined})}
- if(route('POST','/api/qr')){const code=clean(b.code);if(!/^OP-[A-Za-z0-9_-]{20,50}$/.test(code))return fail(res,400,'Code incorrect');const qr=cp.spawnSync(process.env.PYTHON||'python3',[path.join(ROOT,'qr.py')],{input:code,timeout:5000,maxBuffer:100000});if(qr.status!==0)return fail(res,503,'Générateur QR indisponible : installer requirements.txt');res.writeHead(200,{'Content-Type':'image/svg+xml','Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'"});return res.end(qr.stdout)}
- if(route('POST','/api/demo-purchase')){const e=db.events.find(e=>e.id===b.eventId&&e.status==='approved');if(!e)return fail(res,404,'Événement indisponible');const sold=db.tickets.filter(t=>t.eventId===e.id).length;if(sold>=e.capacity)return fail(res,409,'Événement complet');const buyer=clean(b.buyer).slice(0,100);if(buyer.length<2)return fail(res,400,'Nom du participant requis');const code='OP-'+crypto.randomBytes(18).toString('base64url');const order={id:uid(),eventId:e.id,amount:e.price,buyer,status:'paid_demo',mode:'simulation',createdAt:now()};const ticket={id:uid(),eventId:e.id,orderId:order.id,buyer,codeHash:sha(code),createdAt:now(),usedAt:null};db.orders.push(order);db.tickets.push(ticket);log('demo_ticket_created',user?.id||null,{eventId:e.id,ticketId:ticket.id});save(db);return json(res,201,{ticket:{id:ticket.id,code,buyer,event:e.title,date:e.date,location:e.location,price:e.price},notice:'PAIEMENT SIMULÉ — ticket de démonstration, sans valeur commerciale'})}
- if(route('POST','/api/scan')){if(!user||!['admin','organizer'].includes(user.role))return fail(res,403,'Connexion agent/organisateur requise');const code=clean(b.code),ticket=db.tickets.find(t=>t.codeHash===sha(code));if(!ticket)return fail(res,404,'QR code inconnu');const e=db.events.find(e=>e.id===ticket.eventId);if(!e||!eventAccess(user,e))return fail(res,403,'Ticket d’un autre organisateur');if(e.status!=='approved')return fail(res,409,'Événement non approuvé');if(ticket.usedAt)return json(res,409,{error:'Ticket déjà utilisé',usedAt:ticket.usedAt,buyer:ticket.buyer});ticket.usedAt=now();log('ticket_scanned',user.id,{ticketId:ticket.id,eventId:e.id});save(db);return json(res,200,{ok:true,buyer:ticket.buyer,event:e.title,usedAt:ticket.usedAt})}
- if(route('GET','/api/tickets')){if(!user)return fail(res,401,'Connexion requise');let ev=new Set(db.events.filter(e=>eventAccess(user,e)).map(e=>e.id));return json(res,200,{tickets:db.tickets.filter(t=>ev.has(t.eventId)).map(t=>({id:t.id,eventId:t.eventId,buyer:t.buyer,usedAt:t.usedAt,createdAt:t.createdAt}))})}
- return fail(res,404,'Route introuvable');
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(__dirname));
+
+// --- CORRECTION ICI : On crée le dossier automatiquement ---
+const dataDir = path.join(__dirname, 'data');
+const dbPath = path.join(dataDir, 'db.json');
+
+// Si le dossier data n'existe pas, on le crée
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  console.log('Dossier data créé:', dataDir);
 }
-const server=http.createServer(async(req,res)=>{try{const u=new URL(req.url,'http://localhost');if(u.pathname.startsWith('/api/'))return await api(req,res,u.pathname);if(!['GET','HEAD'].includes(req.method))return fail(res,405,'Méthode non autorisée');let rel=u.pathname==='/'?'/index.html':u.pathname;let file=path.resolve(PUBLIC,'.'+decodeURIComponent(rel));if(!file.startsWith(PUBLIC+path.sep))return fail(res,403,'Accès interdit');fs.stat(file,(err,stat)=>{if(err||!stat.isFile()){res.writeHead(404);return res.end('Introuvable')}res.writeHead(200,{'Content-Type':mime[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':file.endsWith('sw.js')?'no-cache':'public, max-age=300'});if(req.method==='HEAD')return res.end();fs.createReadStream(file).pipe(res)})}catch(e){console.error(e);if(!res.headersSent)fail(res,500,'Erreur interne')}});
-server.listen(PORT,()=>console.log(`OUAGA PASS sur http://localhost:${PORT} (prototype, paiements simulés)`));
+
+// Si db.json n'existe pas, on le crée avec des données vides
+if (!fs.existsSync(dbPath)) {
+  fs.writeFileSync(dbPath, JSON.stringify({ events: [], tickets: [] }, null, 2));
+  console.log('db.json créé');
+}
+
+function load() {
+  try {
+    return JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+  } catch (e) {
+    return { events: [], tickets: [] };
+  }
+}
+
+function save(data) {
+  // Sécurité supplémentaire
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  const tmpPath = dbPath + '.tmp';
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tmpPath, dbPath);
+}
+
+// Tes routes...
+app.get('/api/events', (req, res) => {
+  const db = load();
+  res.json(db.events || []);
+});
+
+app.post('/api/events', (req, res) => {
+  const db = load();
+  db.events = db.events || [];
+  db.events.push(req.body);
+  save(db);
+  res.json({ success: true });
+});
+
+// Laisse le reste de tes routes pareil, mais utilise load() et save()
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(OUAGA PASS lancé sur port ${PORT});
+});
